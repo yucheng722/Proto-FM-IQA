@@ -1,0 +1,311 @@
+import os
+os.environ["MPLCONFIGDIR"] = "/path/to/log"
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import numpy as np
+import SimpleITK as sitk
+import glob
+import random
+
+def preprocess_image_sitk(img_path, target_size=(192, 192, 32)):
+    img_sitk = sitk.ReadImage(str(img_path))
+    img_array = sitk.GetArrayFromImage(img_sitk)  
+
+    D_orig = img_array.shape[0]
+    target_D = target_size[2]
+
+    if D_orig >= target_D:
+        start = D_orig // 2 - target_D // 2
+        img_array = img_array[start: start + target_D]
+    else:
+        pad_w = (target_D - D_orig) // 2
+        pad_rem = target_D - D_orig - pad_w
+        img_array = np.pad(img_array, ((pad_w, pad_rem), (0, 0), (0, 0)), 'constant')
+
+    img_crop_sitk = sitk.GetImageFromArray(img_array)
+    original_size = img_crop_sitk.GetSize()
+    original_spacing = img_crop_sitk.GetSpacing()
+
+    new_size_sitk = [target_size[0], target_size[1], target_size[2]]  
+    new_spacing = [
+        original_spacing[0] * original_size[0] / new_size_sitk[0],
+        original_spacing[1] * original_size[1] / new_size_sitk[1],
+        original_spacing[2] * original_size[2] / new_size_sitk[2]
+    ]
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize(new_size_sitk)
+    resampler.SetOutputSpacing(new_spacing)
+    resampler.SetOutputOrigin(img_crop_sitk.GetOrigin())
+    resampler.SetOutputDirection(img_crop_sitk.GetDirection())
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(0)
+
+    img_resized = resampler.Execute(img_crop_sitk)
+    img_array_final = sitk.GetArrayFromImage(img_resized)  
+
+    img_tensor = torch.from_numpy(img_array_final).float()
+    mean = img_tensor.mean()
+    std = img_tensor.std()
+    img_tensor = (img_tensor - mean) / (std + 1e-8)
+
+    return img_tensor.unsqueeze(0)  
+
+
+def extract_b_value(path):
+    fname = os.path.basename(path).lower()
+    
+    special_map = {
+        "1k6": 1600,
+        "2k": 2000,
+        "1k5": 1500,
+        "1k4": 1400
+    }
+    for key, val in special_map.items():
+        if key in fname:
+            return val
+
+    parts = fname.split('_')
+    for p in parts:
+        if p.startswith('b') and p[1:].isdigit():
+            return int(p[1:])
+    return 0  
+
+def get_file_list(base_dir, sub_dir, file_pattern="*.nii*"):
+    path = os.path.join(base_dir, sub_dir)
+    files = sorted(glob.glob(os.path.join(path, file_pattern)))
+    if len(files) == 0:
+        print(f"Warning: No files found in {path}")
+    return files
+
+
+class DualChannelDataset(Dataset):
+    def __init__(self, dwi_paths, t2_paths, labels, b_map=None):
+        self.dwi_paths = dwi_paths
+        self.t2_paths = t2_paths
+        self.labels = labels
+        self.b_map = b_map
+
+        assert len(dwi_paths) == len(t2_paths)
+        assert len(dwi_paths) == len(labels)
+
+    def __len__(self):
+        return len(self.dwi_paths)
+
+    def __getitem__(self, idx):
+        dwi = preprocess_image_sitk(self.dwi_paths[idx])  
+        t2  = preprocess_image_sitk(self.t2_paths[idx])   
+
+        image = torch.cat([dwi, t2], dim=0)               
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+
+        phy_b = extract_b_value(self.dwi_paths[idx])
+        if self.b_map is not None:
+            b_val = torch.tensor(self.b_map.get(phy_b, 0), dtype=torch.long)
+        else:
+            b_val = torch.tensor(phy_b, dtype=torch.long)
+
+        return image, label, b_val
+
+
+def build_balanced_sampler(labels):
+    labels = torch.tensor(labels)
+    class_count = torch.bincount(labels)
+
+    weights = 1.0 / class_count[labels]
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True
+    )
+    return sampler
+
+
+def get_dataloader_dual(
+    task_name,
+    src_base,
+    tgt_base,
+    batch_size,
+    n_shot
+):
+    print(">>> Building B-value vocabulary...")
+    all_files = []
+    all_files += glob.glob(f"{src_base}/source/*.nii*")
+    all_files += glob.glob(f"{src_base}/target/*.nii*")
+
+    unique_b = sorted(set(extract_b_value(p) for p in all_files))
+    b_map = {b: i for i, b in enumerate(unique_b)}
+    print(f"B-map: {b_map}")
+
+    print(">>> Loading Source Domain...")
+
+    s_dwi0 = get_file_list(src_base, "source")
+    s_t20  = get_file_list(src_base, "source_t2")
+
+    s_dwi1 = get_file_list(src_base, "target")
+    s_t21  = get_file_list(src_base, "target_t2")
+
+    src_dwi = s_dwi0 + s_dwi1
+    src_t2  = s_t20  + s_t21
+    src_lbl = [0] * len(s_dwi0) + [1] * len(s_dwi1)
+
+    source_ds = DualChannelDataset(src_dwi, src_t2, src_lbl, b_map)
+    source_sampler = build_balanced_sampler(src_lbl)
+
+    source_loader = DataLoader(
+        source_ds,
+        batch_size=batch_size,
+        sampler=source_sampler,
+        num_workers=0
+    )
+
+    print(">>> Loading Target Domain (Few-shot)")
+
+    def load_query_only(base_sub):
+        base = os.path.join(tgt_base, base_sub)
+        dwi = get_file_list(base, "query_dwi")
+        t2  = get_file_list(base, "query_t2")
+        return dwi, t2
+
+    def load_support_only(base_sub):
+        base = os.path.join(tgt_base, base_sub)
+        dwi = get_file_list(base, "support_dwi")
+        t2  = get_file_list(base, "support_t2")
+        return dwi, t2
+
+    qry_dwi0, qry_t20 = load_query_only(task_name + "_0")
+    qry_dwi1, qry_t21 = load_query_only(task_name + "_1")
+    
+    sup_dwi0, sup_t20 = load_support_only(task_name + "_0")
+    sup_dwi1, sup_t21 = load_support_only(task_name + "_1")
+
+    def split_support_query(dwi, t2, label):
+        idx = list(range(len(dwi)))
+        random.shuffle(idx)
+
+        sup_idx = idx[:n_shot]
+        qry_idx = idx[n_shot:]
+
+        sup_dwi = [dwi[i] for i in sup_idx]
+        sup_t2  = [t2[i]  for i in sup_idx]
+        sup_lbl = [label] * len(sup_dwi)
+
+        qry_dwi = [dwi[i] for i in qry_idx]
+        qry_t2  = [t2[i]  for i in qry_idx]
+        qry_lbl = [label] * len(qry_dwi)
+
+        return sup_dwi, sup_t2, sup_lbl, qry_dwi, qry_t2, qry_lbl
+
+    support_ds = DualChannelDataset(
+        sup_dwi0 + sup_dwi1,
+        sup_t20  + sup_t21,
+        [0] * len(sup_dwi0) + [1] * len(sup_dwi1),
+        b_map
+    )
+
+    query_ds = DualChannelDataset(
+        qry_dwi0 + qry_dwi1,
+        qry_t20  + qry_t21,
+        [0] * len(qry_dwi0) + [1] * len(qry_dwi1),
+        b_map
+    )
+
+    support_loader = DataLoader(support_ds, batch_size=1, shuffle=False)
+    query_loader   = DataLoader(query_ds,   batch_size=1, shuffle=False)
+
+    print(f"Source samples: {len(source_ds)}")
+    print(f"Support: {len(support_ds)} | Query: {len(query_ds)}")
+
+    def load_query_PROMIS():
+        qry_dwi0_p = get_file_list(tgt_base, "Cls_0_PROMIS/query_dwi")
+        qry_t20_p  = get_file_list(tgt_base, "Cls_0_PROMIS/query_t2")
+        qry_dwi1_p = get_file_list(tgt_base, "Cls_1_PROMIS/query_dwi")
+        qry_t21_p  = get_file_list(tgt_base, "Cls_1_PROMIS/query_t2")
+        return qry_dwi0_p, qry_t20_p,qry_dwi1_p, qry_t21_p
+
+    def load_support_PROMIS():
+        sup_dwi0_p = get_file_list(tgt_base, "Cls_0_PROMIS/support_dwi")
+        sup_t20_p  = get_file_list(tgt_base, "Cls_0_PROMIS/support_t2")
+        sup_dwi1_p = get_file_list(tgt_base, "Cls_1_PROMIS/support_dwi")
+        sup_t21_p  = get_file_list(tgt_base, "Cls_1_PROMIS/support_t2")
+        return sup_dwi0_p, sup_t20_p,sup_dwi1_p, sup_t21_p
+
+    qry_dwi0_p, qry_t20_p,qry_dwi1_p, qry_t21_p = load_query_PROMIS()
+    sup_dwi0_p, sup_t20_p,sup_dwi1_p, sup_t21_p = load_support_PROMIS()
+
+    support_ds_PROMIS = DualChannelDataset(
+        sup_dwi0_p + sup_dwi1_p,
+        sup_t20_p  + sup_t21_p,
+        [0] * len(sup_dwi0_p) + [1] * len(sup_dwi1_p),
+        b_map
+    )
+
+    query_ds_PROMIS = DualChannelDataset(
+        qry_dwi0_p + qry_dwi1_p,
+        qry_t20_p  + qry_t21_p,
+        [0] * len(qry_dwi0_p) + [1] * len(qry_dwi1_p),
+        b_map
+    )
+    support_loader_PROMIS = DataLoader(support_ds_PROMIS, batch_size=1, shuffle=False)
+    query_loader_PROMIS   = DataLoader(query_ds_PROMIS,   batch_size=1, shuffle=False)
+
+    return (source_loader, support_loader_PROMIS, query_loader_PROMIS,
+            support_loader, query_loader, unique_b)
+
+
+class EpisodeDatasetWithB(Dataset):
+    def __init__(self, base_dataset, n_way=2, k_shot=5, n_query=5):
+        self.base_dataset = base_dataset
+        self.n_way = n_way
+        self.k_shot = k_shot
+        self.n_query = n_query
+
+        self.class_indices = {}
+        for idx in range(len(base_dataset)):
+            img, label, b_idx = base_dataset[idx]
+            label = int(label)
+            if label not in self.class_indices:
+                self.class_indices[label] = []
+            self.class_indices[label].append(idx)
+
+        self.classes = list(self.class_indices.keys())
+
+    def __len__(self):
+        return 100  
+
+    def __getitem__(self, idx):
+        selected_classes = random.sample(self.classes, self.n_way)
+
+        support_images = []
+        support_labels = []
+        support_b_idxs = []
+        query_images = []
+        query_labels = []
+        query_b_idxs = []
+
+        for class_idx, cls in enumerate(selected_classes):
+            class_samples = random.sample(self.class_indices[cls], self.k_shot + self.n_query)
+
+            for i in range(self.k_shot):
+                sample_idx = class_samples[i]
+                img, label, b_idx = self.base_dataset[sample_idx]
+                support_images.append(img)
+                support_labels.append(class_idx)  
+                support_b_idxs.append(b_idx)
+
+            for i in range(self.k_shot, self.k_shot + self.n_query):
+                sample_idx = class_samples[i]
+                img, label, b_idx = self.base_dataset[sample_idx]
+                query_images.append(img)
+                query_labels.append(class_idx)  
+                query_b_idxs.append(b_idx)
+
+        support_images = torch.stack(support_images)
+        support_labels = torch.tensor(support_labels, dtype=torch.long)
+        support_b_idxs = torch.tensor(support_b_idxs, dtype=torch.long)
+        query_images = torch.stack(query_images)
+        query_labels = torch.tensor(query_labels, dtype=torch.long)
+        query_b_idxs = torch.tensor(query_b_idxs, dtype=torch.long)
+
+        return (support_images, support_labels, support_b_idxs,
+                query_images, query_labels, query_b_idxs)
