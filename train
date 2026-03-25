@@ -1,0 +1,832 @@
+已为您完成脱敏处理。所有的中文注释已全部被移除，同时也对涉及个人/项目文件系统的硬编码路径（`dir`）进行了替换（统一使用 `/path/to/...` 代替）。代码的任何执行逻辑和结构都严格保持不变。
+
+import os
+os.environ["MPLCONFIGDIR"] = "/path/to/log"
+import argparse
+import random
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Function
+import numpy as np
+import glob
+import scipy.ndimage as ndimage
+from tqdm import tqdm
+from proto_train.resnet import ResNet, BasicBlock
+from proto_train.data import EpisodeDatasetWithB
+from sklearn.metrics import roc_auc_score
+from proto_train.PNN import compute_conditional_metrics
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from proto_train.data import extract_b_value, get_file_list, preprocess_image_sitk, build_balanced_sampler
+
+class DualChannelDataset(Dataset):
+    def __init__(self, dwi_paths, t2_paths, labels, b_map=None, is_train=False):
+        self.dwi_paths = dwi_paths
+        self.t2_paths = t2_paths
+        self.labels = labels
+        self.b_map = b_map
+        self.is_train = is_train  
+
+        assert len(dwi_paths) == len(t2_paths)
+        assert len(dwi_paths) == len(labels)
+
+    def __len__(self):
+        return len(self.dwi_paths)
+
+    def __getitem__(self, idx):
+        dwi = preprocess_image_sitk(self.dwi_paths[idx])  
+        t2  = preprocess_image_sitk(self.t2_paths[idx])   
+
+        image = torch.cat([dwi, t2], dim=0)               
+        image = image.float()
+        
+        # ==========================================
+        if self.is_train:
+            image = apply_domain_randomization(image)
+
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+
+        phy_b = extract_b_value(self.dwi_paths[idx])
+        if self.b_map is not None:
+            b_val = torch.tensor(self.b_map.get(phy_b, 0), dtype=torch.long)
+        else:
+            b_val = torch.tensor(phy_b, dtype=torch.long)
+
+        return image, label, b_val
+
+def random_noise(image, prob=0.5, mean=0.0, std_range=(0.01, 0.05)):
+    if random.random() < prob:
+        std = random.uniform(*std_range)
+        noise = torch.randn_like(image) * std + mean
+        image = image + noise
+    return image
+
+
+def random_blur_3d(image, prob=0.5, sigma_range=(0.5, 1.5)):
+    if random.random() < prob:
+        sigma = random.uniform(*sigma_range)
+        for c in range(image.shape[0]):
+            img_np = image[c].numpy()
+            blurred_np = ndimage.gaussian_filter(img_np, sigma=sigma)
+            image[c] = torch.from_numpy(blurred_np)
+    return image
+
+
+def random_contrast_brightness(image, prob=0.5, contrast_range=(0.7, 1.3), brightness_range=(-0.1, 0.1)):
+    if random.random() < prob:
+        contrast_factor = random.uniform(*contrast_range)
+        brightness_factor = random.uniform(*brightness_range)
+        # image = (image - mean) * contrast + mean + brightness
+        mean_val = torch.mean(image)
+        image = (image - mean_val) * contrast_factor + mean_val + brightness_factor
+    return image
+
+
+def apply_domain_randomization(image):
+    # image shape: (Channels, Depth, Height, Width)
+    image = random_contrast_brightness(image, prob=0.6)
+    image = random_noise(image, prob=0.5)
+    image = random_blur_3d(image, prob=0.4)
+    return image
+
+def get_dataloader_dual(src_base, tgt_base, batch_size, n_shot):
+    # ---------- 1. Build B-map ----------
+    print(">>> Building B-value vocabulary...")
+    all_files = []
+    all_files += glob.glob(f"{src_base}/source/*.nii*")
+    all_files += glob.glob(f"{src_base}/target/*.nii*")
+
+    unique_b = sorted(set(extract_b_value(p) for p in all_files))
+    b_map = {b: i for i, b in enumerate(unique_b)}
+    print(f"B-map: {b_map}")
+
+    # ---------- 2. Source Domain (Balanced Batch) ----------
+    print(">>> Loading Source Domain...")
+    s_dwi0 = get_file_list(src_base, "source")
+    s_t20 = get_file_list(src_base, "source_t2")
+    s_dwi1 = get_file_list(src_base, "target")
+    s_t21 = get_file_list(src_base, "target_t2")
+
+    src_dwi = s_dwi0 + s_dwi1
+    src_t2 = s_t20 + s_t21
+    src_lbl = [0] * len(s_dwi0) + [1] * len(s_dwi1)
+
+    source_ds = DualChannelDataset(src_dwi, src_t2, src_lbl, b_map, is_train=True)
+    source_sampler = build_balanced_sampler(src_lbl)
+    source_loader = DataLoader(source_ds, batch_size=batch_size, sampler=source_sampler, num_workers=0)
+    
+    # ---------- 3. Helper to Merge Support and Query Dirs ----------
+    def load_merged_data(base_sub):
+        base = os.path.join(tgt_base, base_sub)
+        dwi = get_file_list(base, "query_dwi") + get_file_list(base, "support_dwi")
+        t2 = get_file_list(base, "query_t2") + get_file_list(base, "support_t2")
+        return dwi, t2
+
+    # ---------- 4. Load Cls_dis Domain Lists ----------
+    dis_dwi0, dis_t20 = load_merged_data("Cls_pro_0")
+    dis_dwi1, dis_t21 = load_merged_data("Cls_pro_1")
+    dis_lists = (dis_dwi0, dis_t20, dis_dwi1, dis_t21)
+
+    # ---------- 5. Load Cls_PIQUAL Domain Lists ----------
+    piqual_dwi0, piqual_t20 = load_merged_data("Cls_PIQUAL_0")
+    piqual_dwi1, piqual_t21 = load_merged_data("Cls_PIQUAL_1")
+    piqual_lists = (piqual_dwi0, piqual_t20, piqual_dwi1, piqual_t21)
+
+    # ---------- 6. Load PROMIS Domain Lists ----------
+    p_dwi0, p_t20 = load_merged_data("Cls_0_PROMIS")
+    p_dwi1, p_t21 = load_merged_data("Cls_1_PROMIS")
+    promis_lists = (p_dwi0, p_t20, p_dwi1, p_t21)
+
+    return source_loader, dis_lists, piqual_lists, promis_lists, b_map, unique_b
+
+
+def get_random_loaders(dwi0, t20, dwi1, t21, b_map, n_shot):
+    import os
+    
+    idx0 = list(range(len(dwi0)))
+    random.shuffle(idx0)
+    sup0_idx, qry0_idx = idx0[:n_shot], idx0[n_shot:]
+
+    idx1 = list(range(len(dwi1)))
+    random.shuffle(idx1)
+    sup1_idx, qry1_idx = idx1[:n_shot], idx1[n_shot:]
+
+    sup_dwi = [dwi0[i] for i in sup0_idx] + [dwi1[i] for i in sup1_idx]
+    sup_t2 = [t20[i] for i in sup0_idx] + [t21[i] for i in sup1_idx]
+    sup_lbl = [0] * n_shot + [1] * n_shot
+
+    support_ids = [os.path.basename(p) for p in sup_dwi]
+
+    qry_dwi = [dwi0[i] for i in qry0_idx] + [dwi1[i] for i in qry1_idx]
+    qry_t2 = [t20[i] for i in qry0_idx] + [t21[i] for i in qry1_idx]
+    qry_lbl = [0] * len(qry0_idx) + [1] * len(qry1_idx)
+
+    support_ds = DualChannelDataset(sup_dwi, sup_t2, sup_lbl, b_map)
+    query_ds = DualChannelDataset(qry_dwi, qry_t2, qry_lbl, b_map)
+
+    support_loader = DataLoader(support_ds, batch_size=1, shuffle=False)
+    query_loader = DataLoader(query_ds, batch_size=1, shuffle=False)
+
+    return support_loader, query_loader, support_ids
+
+
+# ==========================================
+# 1. Core Modules: GRL, FiLM, Masked Norm
+# ==========================================
+
+class GradientReversalLayer(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+
+def grad_reverse(x, alpha=1.0):
+    return GradientReversalLayer.apply(x, alpha)
+
+
+class FiLM(nn.Module):
+    def __init__(self, features, embedding_dim):
+        super(FiLM, self).__init__()
+        self.features = features
+        self.fc = nn.Linear(embedding_dim, 2 * features)
+        self.fc.weight.data.fill_(0)
+        self.fc.bias.data.fill_(0)
+        self.fc.bias.data[:features] = 1
+
+    def forward(self, x, embedding):
+        params = self.fc(embedding)
+        gamma, beta = torch.split(params, self.features, dim=1)
+        gamma = gamma.view(gamma.size(0), gamma.size(1), 1, 1, 1)
+        beta = beta.view(beta.size(0), beta.size(1), 1, 1, 1)
+        return x * gamma + beta
+
+
+class DWIOnly_MaskedInstanceNorm3d(nn.Module):
+    def __init__(self, num_channels=2, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        dwi = x[:, 0:1, ...]
+        t2 = x[:, 1:2, ...]
+        with torch.no_grad():
+            dwi_mask = (dwi > dwi.mean(dim=(2, 3, 4), keepdim=True)).float()
+        mask_sum = dwi_mask.sum(dim=(2, 3, 4), keepdim=True) + self.eps
+        dwi_mean = (dwi * dwi_mask).sum(dim=(2, 3, 4), keepdim=True) / mask_sum
+        dwi_var = ((dwi - dwi_mean) ** 2 * dwi_mask).sum(dim=(2, 3, 4), keepdim=True) / mask_sum
+        dwi_norm = (dwi - dwi_mean) / torch.sqrt(dwi_var + self.eps)
+        t2_norm = t2
+        return torch.cat([dwi_norm * dwi_mask, t2_norm], dim=1)
+
+
+# ==========================================
+# 2. Lightweight Attention Fusion
+# ==========================================
+
+class LightweightAttentionFusion(nn.Module):
+    def __init__(self, channels=512):
+        super().__init__()
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1), nn.Flatten(),
+            nn.Linear(channels * 2, channels // 8), nn.ReLU(),
+            nn.Linear(channels // 8, channels * 2), nn.Sigmoid()
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv3d(2, 1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(1), nn.Sigmoid()
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv3d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(channels), nn.ReLU(inplace=True)
+        )
+
+    def forward(self, dwi_feat, t2_feat):
+        combined = torch.cat([dwi_feat, t2_feat], dim=1)
+        channel_weights = self.channel_attention(combined)
+        channel_weights = channel_weights.view(-1, 2, 512)
+        dwi_weight = channel_weights[:, 0, :].view(-1, 512, 1, 1, 1)
+        t2_weight = channel_weights[:, 1, :].view(-1, 512, 1, 1, 1)
+        dwi_weighted = dwi_feat * dwi_weight
+        t2_weighted = t2_feat * t2_weight
+        dwi_spatial = torch.mean(dwi_weighted, dim=1, keepdim=True)
+        t2_spatial = torch.mean(t2_weighted, dim=1, keepdim=True)
+        spatial_input = torch.cat([dwi_spatial, t2_spatial], dim=1)
+        spatial_weights = self.spatial_attention(spatial_input)
+        weighted_sum = (dwi_weighted + t2_weighted) * spatial_weights
+        fused = self.fusion_conv(torch.cat([dwi_feat, t2_feat], dim=1))
+        fused = fused + weighted_sum
+        return fused
+
+
+# ==========================================
+# 3. Model Architecture
+# ==========================================
+
+class DualPathConditionedResNet(nn.Module):
+    def __init__(self, original_backbone, b_vocab_size, embedding_dim=16,
+                 pretrained_path=None, mode='dual'):
+        super().__init__()
+        self.mode = mode
+
+        def _create_backbone(original_backbone, pretrained_path, channel=1):
+            backbone = ResNet(BasicBlock, [2, 2, 2, 2],
+                              sample_input_D=32, sample_input_H=192, sample_input_W=192,
+                              num_seg_classes=512)
+            if pretrained_path and os.path.exists(pretrained_path):
+                state = torch.load(pretrained_path, map_location='cpu')
+                new_state = {k.replace("module.", ""): v for k, v in state.items()}
+                own_state = backbone.state_dict()
+                for name, param in new_state.items():
+                    if name in own_state:
+                        if name == 'conv1.weight':
+                            if param.size(1) == 1:
+                                own_state[name][:, :channel, ...] = param[:, :, ...]
+                            else:
+                                own_state[name][:, :channel, ...] = param[:, :1, ...]
+                        else:
+                            own_state[name].copy_(param)
+            old_conv = backbone.conv1
+            backbone.conv1 = nn.Conv3d(channel, old_conv.out_channels,
+                                       kernel_size=old_conv.kernel_size, stride=old_conv.stride,
+                                       padding=old_conv.padding, bias=old_conv.bias)
+            if pretrained_path and os.path.exists(pretrained_path):
+                with torch.no_grad():
+                    backbone.conv1.weight[:, :channel, ...] = old_conv.weight[:, :channel, ...]
+                    if backbone.conv1.bias is not None:
+                        backbone.conv1.bias.data.copy_(old_conv.bias.data)
+            return backbone
+
+        if self.mode == 'dual':
+            self.dwi_backbone = _create_backbone(original_backbone, pretrained_path, channel=1)
+            self.t2_backbone = _create_backbone(original_backbone, pretrained_path, channel=1)
+            self.b_embedding = nn.Embedding(b_vocab_size, embedding_dim)
+            self.film1 = FiLM(64, embedding_dim)
+            self.film2 = FiLM(128, embedding_dim)
+            self.film3 = FiLM(256, embedding_dim)
+            self.film4 = FiLM(512, embedding_dim)
+            self.dwi_only_norm = DWIOnly_MaskedInstanceNorm3d(num_channels=2)
+            self.fusion = LightweightAttentionFusion(channels=512)
+
+        elif self.mode == 'dwi_only_conditioned':
+            self.dwi_backbone = _create_backbone(original_backbone, pretrained_path, channel=1)
+            self.b_embedding = nn.Embedding(b_vocab_size, embedding_dim)
+            self.film1 = FiLM(64, embedding_dim)
+            self.film2 = FiLM(128, embedding_dim)
+            self.film3 = FiLM(256, embedding_dim)
+            self.film4 = FiLM(512, embedding_dim)
+            self.dwi_only_norm = DWIOnly_MaskedInstanceNorm3d(num_channels=2)
+
+        elif self.mode == 'dwi_only_plain':
+            self.dwi_backbone = _create_backbone(original_backbone, pretrained_path, channel=1)
+
+    def forward(self, x, b_idx):
+        if self.mode == 'dual':
+            x_norm = self.dwi_only_norm(x)
+            dwi = x_norm[:, 0:1, ...]
+            t2 = x_norm[:, 1:2, ...]
+            b_emb = self.b_embedding(b_idx)
+            dwi_feat = self.dwi_backbone.conv1(dwi)
+            dwi_feat = self.dwi_backbone.bn1(dwi_feat)
+            dwi_feat = self.dwi_backbone.relu(dwi_feat)
+            dwi_feat = self.dwi_backbone.maxpool(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer1(dwi_feat)
+            dwi_feat = self.film1(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer2(dwi_feat)
+            dwi_feat = self.film2(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer3(dwi_feat)
+            dwi_feat = self.film3(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer4(dwi_feat)
+            dwi_feat = self.film4(dwi_feat, b_emb)
+
+            t2_feat = self.t2_backbone.conv1(t2)
+            t2_feat = self.t2_backbone.bn1(t2_feat)
+            t2_feat = self.t2_backbone.relu(t2_feat)
+            t2_feat = self.t2_backbone.maxpool(t2_feat)
+            t2_feat = self.t2_backbone.layer1(t2_feat)
+            t2_feat = self.t2_backbone.layer2(t2_feat)
+            t2_feat = self.t2_backbone.layer3(t2_feat)
+            t2_feat = self.t2_backbone.layer4(t2_feat)
+
+            fused = self.fusion(dwi_feat, t2_feat)
+            return fused, b_emb
+
+        elif self.mode == 'dwi_only_conditioned':
+            dwi = x[:, 0:1, ...]
+            x_norm = self.dwi_only_norm(x)
+            dwi_norm = x_norm[:, 0:1, ...]
+            b_emb = self.b_embedding(b_idx)
+            dwi_feat = self.dwi_backbone.conv1(dwi_norm)
+            dwi_feat = self.dwi_backbone.bn1(dwi_feat)
+            dwi_feat = self.dwi_backbone.relu(dwi_feat)
+            dwi_feat = self.dwi_backbone.maxpool(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer1(dwi_feat)
+            dwi_feat = self.film1(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer2(dwi_feat)
+            dwi_feat = self.film2(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer3(dwi_feat)
+            dwi_feat = self.film3(dwi_feat, b_emb)
+            dwi_feat = self.dwi_backbone.layer4(dwi_feat)
+            dwi_feat = self.film4(dwi_feat, b_emb)
+            return dwi_feat, b_emb
+
+        elif self.mode == 'dwi_only_plain':
+            dwi = x[:, 0:1, ...]
+            dwi_feat = self.dwi_backbone.conv1(dwi)
+            dwi_feat = self.dwi_backbone.bn1(dwi_feat)
+            dwi_feat = self.dwi_backbone.relu(dwi_feat)
+            dwi_feat = self.dwi_backbone.maxpool(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer1(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer2(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer3(dwi_feat)
+            dwi_feat = self.dwi_backbone.layer4(dwi_feat)
+            return dwi_feat, None
+
+
+class Model(nn.Module):
+    def __init__(self, backbone, num_classes=2, num_prototypes=5, b_vocab_size=10,
+                 pretrained_path=None, mode='dual'):
+        super(Model, self).__init__()
+        self.mode = mode
+
+        self.encoder = DualPathConditionedResNet(backbone, b_vocab_size,
+                                                 pretrained_path=pretrained_path,
+                                                 mode=mode)
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.projector = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+        self.prototypes = nn.Parameter(torch.randn(num_classes, num_prototypes, 128))
+
+        if mode in ['dual', 'dwi_only_conditioned']:
+            self.discriminator = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Linear(256, b_vocab_size)
+            )
+        else:
+            self.discriminator = None
+
+    def forward_encoder(self, x, b_idx):
+        feat_map, b_emb = self.encoder(x, b_idx)
+        feat = self.avgpool(feat_map)
+        emb = self.projector(feat)
+        return F.normalize(emb, dim=1)
+
+    def forward_with_prototypes(self, x, b_idx, prototypes, alpha_grl=1.0):
+        feat_map, b_emb = self.encoder(x, b_idx)
+        feat_vec = self.avgpool(feat_map)
+        emb = self.projector(feat_vec)
+        emb_norm = F.normalize(emb, p=2, dim=1)
+
+        if prototypes is not None:
+            proto_norm = F.normalize(prototypes, p=2, dim=1)
+            logits = torch.matmul(emb_norm, proto_norm.T)
+        else:
+            proto_norm = F.normalize(self.prototypes, p=2, dim=2)
+            sim_matrix = torch.einsum('bd,ckd->bck', emb_norm, proto_norm)
+            logits, _ = torch.max(sim_matrix, dim=2)
+
+        b_pred = None
+        if self.discriminator is not None and b_emb is not None:
+            feat_rev = grad_reverse(feat_vec, alpha_grl)
+            b_pred = self.discriminator(feat_rev)
+
+        return logits, emb, b_pred
+
+    def forward(self, x, b_idx, alpha_grl=1.0):
+        return self.forward_with_prototypes(x, b_idx, None, alpha_grl)
+
+
+# ==========================================
+# 4. Few-Shot Adaptation Logic
+# ==========================================
+
+def run_few_shot_test(model, support_loader, query_loader, device, k_shot=5):
+    model.eval()
+    support_embs = []
+    support_lbls = []
+    all_scores = []
+    all_labels = []
+    with torch.no_grad():
+        for imgs, lbls, b_idxs in support_loader:
+            imgs, b_idxs = imgs.to(device), b_idxs.to(device)
+            feat_map, _ = model.encoder(imgs, b_idxs)
+            feat_vec = model.avgpool(feat_map)
+            emb = model.projector(feat_vec)
+            support_embs.append(emb)
+            support_lbls.append(lbls)
+
+    support_embs = torch.cat(support_embs, dim=0)
+    support_lbls = torch.cat(support_lbls, dim=0)
+    unique_classes = torch.unique(support_lbls)
+    adapted_protos = {}
+    for c in unique_classes:
+        c = c.item()
+        mask = (support_lbls == c)
+        proto = F.normalize(support_embs[mask].mean(dim=0), p=2, dim=0)
+        adapted_protos[c] = proto
+
+    correct = 0
+    total = 0
+    TP, TN, FP, FN = 0, 0, 0, 0
+    with torch.no_grad():
+        for imgs, lbls, b_idxs in query_loader:
+            imgs, lbls, b_idxs = imgs.to(device), lbls.to(device), b_idxs.to(device)
+            feat_map, _ = model.encoder(imgs, b_idxs)
+            emb = model.projector(model.avgpool(feat_map))
+            emb_norm = F.normalize(emb, p=2, dim=1)
+            scores = []
+            for c in [0, 1]:
+                if c in adapted_protos:
+                    proto = adapted_protos[c].to(device)
+                    proto_norm = F.normalize(proto.unsqueeze(0), p=2, dim=1)
+                    sim = torch.matmul(emb_norm, proto_norm.T)
+                    scores.append(sim)
+                else:
+                    scores.append(torch.full((emb.size(0), 1), -1e9).to(device))
+            scores = torch.cat(scores, dim=1)
+            preds = torch.argmax(scores, dim=1)
+            prob_pos = F.softmax(scores, dim=1)[:, 1]
+            all_scores.append(prob_pos.detach().cpu())
+            all_labels.append(lbls.detach().cpu())
+            correct += (preds == lbls).sum().item()
+            total += lbls.size(0)
+            tp = ((preds == 1) & (lbls == 1)).sum().item()
+            tn = ((preds == 0) & (lbls == 0)).sum().item()
+            fp = ((preds == 1) & (lbls == 0)).sum().item()
+            fn = ((preds == 0) & (lbls == 1)).sum().item()
+            TP += tp;
+            TN += tn;
+            FP += fp;
+            FN += fn
+
+    acc = correct / max(total, 1)
+    sens = TP / (TP + FN + 1e-8)
+    spec = TN / (TN + FP + 1e-8)
+    all_scores = torch.cat(all_scores).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    auc = roc_auc_score(all_labels, all_scores)
+    sen_at_80spec, spe_at_80sens = compute_conditional_metrics(all_labels, all_scores)
+    return acc, sens, spec, auc, sen_at_80spec, spe_at_80sens
+
+
+def extract_and_cache_features(model, data_lists, b_map, device):
+    dwi0, t20, dwi1, t21 = data_lists
+
+    all_dwi = dwi0 + dwi1
+    all_t2 = t20 + t21
+    all_lbl = [0] * len(dwi0) + [1] * len(dwi1)
+
+    full_ds = DualChannelDataset(all_dwi, all_t2, all_lbl, b_map)
+    full_loader = DataLoader(full_ds, batch_size=1, shuffle=False, num_workers=0)
+
+    cached_features = {}
+    model.eval()
+
+    with torch.no_grad():
+        for i, (imgs, lbls, b_idxs) in enumerate(full_loader):
+            imgs, b_idxs = imgs.to(device), b_idxs.to(device)
+            feat_map, _ = model.encoder(imgs, b_idxs)
+            feat_vec = model.avgpool(feat_map)
+            emb = model.projector(feat_vec)
+
+            img_id = os.path.basename(all_dwi[i])
+
+            cached_features[img_id] = {
+                "emb": emb.cpu(),  
+                "label": lbls.item()
+            }
+
+    return cached_features
+
+
+def evaluate_50_runs(model, data_lists, b_map, n_shot, device):
+    import os
+    import random
+
+    cached_features = extract_and_cache_features(model, data_lists, b_map, device)
+
+    dwi0, t20, dwi1, t21 = data_lists
+
+    metrics_all = {"acc": [], "sens": [], "spec": [], "auc": [], "sen@80spec": [], "spe@80sens": []}
+    support_ids_all = []
+
+    ids_0 = [os.path.basename(p) for p in dwi0]
+    ids_1 = [os.path.basename(p) for p in dwi1]
+
+    for _ in range(50):
+        random.shuffle(ids_0)
+        random.shuffle(ids_1)
+
+        sup0_ids, qry0_ids = ids_0[:n_shot], ids_0[n_shot:]
+        sup1_ids, qry1_ids = ids_1[:n_shot], ids_1[n_shot:]
+
+        sup_ids = sup0_ids + sup1_ids
+        qry_ids = qry0_ids + qry1_ids
+
+        support_ids_all.append(sup_ids)
+
+        sup_embs_0 = torch.cat([cached_features[i]["emb"] for i in sup0_ids], dim=0).to(device)
+        sup_embs_1 = torch.cat([cached_features[i]["emb"] for i in sup1_ids], dim=0).to(device)
+
+        proto_0 = F.normalize(sup_embs_0.mean(dim=0, keepdim=True), p=2, dim=1)
+        proto_1 = F.normalize(sup_embs_1.mean(dim=0, keepdim=True), p=2, dim=1)
+        prototypes = torch.cat([proto_0, proto_1], dim=0)  
+
+        qry_embs = torch.cat([cached_features[i]["emb"] for i in qry_ids], dim=0).to(device)
+        qry_lbls = torch.tensor([cached_features[i]["label"] for i in qry_ids]).to(device)
+
+        qry_embs_norm = F.normalize(qry_embs, p=2, dim=1)
+
+        sim_scores = torch.matmul(qry_embs_norm, prototypes.T)  
+
+        preds = torch.argmax(sim_scores, dim=1)
+        prob_pos = F.softmax(sim_scores, dim=1)[:, 1]
+
+        correct = (preds == qry_lbls).sum().item()
+        total = len(qry_lbls)
+
+        tp = ((preds == 1) & (qry_lbls == 1)).sum().item()
+        tn = ((preds == 0) & (qry_lbls == 0)).sum().item()
+        fp = ((preds == 1) & (qry_lbls == 0)).sum().item()
+        fn = ((preds == 0) & (qry_lbls == 1)).sum().item()
+
+        acc = correct / max(total, 1)
+        sens = tp / (tp + fn + 1e-8)
+        spec = tn / (tn + fp + 1e-8)
+
+        prob_pos_np = prob_pos.detach().cpu().numpy()
+        lbls_np = qry_lbls.cpu().numpy()
+
+        auc = roc_auc_score(lbls_np, prob_pos_np)
+        sen_at_80spec, spe_at_80sens = compute_conditional_metrics(lbls_np, prob_pos_np)
+
+        metrics_all["acc"].append(acc)
+        metrics_all["sens"].append(sens)
+        metrics_all["spec"].append(spec)
+        metrics_all["auc"].append(auc)
+        metrics_all["sen@80spec"].append(sen_at_80spec)
+        metrics_all["spe@80sens"].append(spe_at_80sens)
+
+    stats = {}
+    for k, v_list in metrics_all.items():
+        v_arr = np.array(v_list)
+        max_idx = int(np.argmax(v_arr))
+        min_idx = int(np.argmin(v_arr))
+
+        stats[k] = {
+            "mean": float(np.mean(v_arr)),
+            "std": float(np.std(v_arr)),
+            "max": float(v_arr[max_idx]),
+            "min": float(v_arr[min_idx]),
+            "max_support_ids": support_ids_all[max_idx],
+            "min_support_ids": support_ids_all[min_idx]
+        }
+    return stats
+
+def train_epoch(epoch, model, train_loader, optimizer, criterion_ce, criterion_adv,
+                device, alpha_grl, n_way):
+    model.train()
+    total_loss = 0;
+    total_cls_loss = 0;
+    total_adv_loss = 0
+
+    for episode in tqdm(train_loader, desc=f"Ep {epoch}"):
+        support_x, support_y, support_b, query_x, query_y, query_b = episode
+        support_x = support_x.squeeze(0).to(device)
+        support_y = support_y.squeeze(0).to(device)
+        support_b = support_b.squeeze(0).to(device)
+        query_x = query_x.squeeze(0).to(device)
+        query_y = query_y.squeeze(0).to(device)
+        query_b = query_b.squeeze(0).to(device)
+
+        support_emb = model.forward_encoder(support_x, support_b)
+        prototypes = []
+        for c in range(n_way):
+            mask = (support_y == c)
+            if mask.sum() > 0:
+                class_proto = F.normalize(support_emb[mask].mean(dim=0, keepdim=True), p=2, dim=1)
+            else:
+                class_proto = torch.zeros(1, support_emb.size(1)).to(device)
+            prototypes.append(class_proto)
+        prototypes = torch.cat(prototypes, dim=0)
+
+        query_logits, _, query_b_pred = model.forward_with_prototypes(query_x, query_b, prototypes, alpha_grl)
+        loss_cls = criterion_ce(query_logits, query_y)
+
+        loss_adv = 0
+        if model.discriminator is not None:
+            _, _, support_b_pred = model.forward_with_prototypes(support_x, support_b, None, alpha_grl)
+            loss_adv = criterion_adv(support_b_pred, support_b)
+
+        loss = loss_cls + 0.5 * loss_adv
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_cls_loss += loss_cls.item()
+        total_adv_loss += loss_adv.item()
+
+    avg_loss = total_loss / len(train_loader)
+    avg_cls_loss = total_cls_loss / len(train_loader)
+    avg_adv_loss = total_adv_loss / len(train_loader)
+    return avg_loss, avg_cls_loss, avg_adv_loss
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--src_base', default="/path/to/data")
+    parser.add_argument('--tgt_base', default="/path/to/data")
+    parser.add_argument("--n_shot", type=int, default=5)
+    parser.add_argument('--n_way', type=int, default=2)
+    parser.add_argument('--n_query', type=int, default=5)
+    parser.add_argument('--output_dir', default="./results_dual_pro_aug")
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--pretrained_path',
+                        default='/path/to/pretrained/resnet_18_23dataset.pth')
+    parser.add_argument('--mode', type=str, default='dual',
+                        choices=['dual', 'dwi_only_conditioned', 'dwi_only_plain'],
+                        help='Model mode: dual (DWI+T2), dwi_only_conditioned (DWI with FiLM), dwi_only_plain (DWI only)')
+
+    args = parser.parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    (train_loader, dis_lists, piqual_lists, promis_lists, b_map, unique_b) = get_dataloader_dual(
+        args.src_base, args.tgt_base, args.batch_size, args.n_shot
+    )
+
+    base_train_dataset = train_loader.dataset
+
+    episode_dataset = EpisodeDatasetWithB(
+        base_dataset=base_train_dataset,
+        n_way=args.n_way,
+        k_shot=args.n_shot,
+        n_query=args.n_query
+    )
+
+    train_episode_loader = DataLoader(
+        episode_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=0
+    )
+
+    raw_backbone = ResNet(BasicBlock, [2, 2, 2, 2],
+                          sample_input_D=32, sample_input_H=192, sample_input_W=192,
+                          num_seg_classes=512)
+
+    model = Model(raw_backbone, b_vocab_size=len(unique_b),
+                  pretrained_path=args.pretrained_path, mode=args.mode).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.3)
+    criterion_adv = nn.CrossEntropyLoss()
+
+    print(f"\n=== Phase 1: Episodic Meta-Training on Source Domain ===")
+    print(f"Model Mode: {args.mode}")
+
+    best_acc = 0
+    for epoch in range(args.epochs):
+        #p = float(epoch) / args.epochs
+        #alpha = 2. / (1. + np.exp(-10 * p)) - 1
+
+        p = float(epoch) / args.epochs
+        warmup_epochs = args.epochs * 0.1
+        if epoch < warmup_epochs:
+            alpha = 1.0 * (float(epoch) / warmup_epochs)
+        else:
+            alpha = 1.0
+
+        avg_loss, avg_cls_loss, avg_adv_loss = train_epoch(
+            epoch, model, train_episode_loader, optimizer, criterion_ce,
+            criterion_adv, device, alpha, args.n_way
+        )
+
+        print(f"Epoch {epoch + 1}/{args.epochs}: Loss={avg_loss:.4f} "
+              f"(Cls={avg_cls_loss:.4f}, Adv={avg_adv_loss:.4f})")
+
+        if (epoch + 1) % 1 == 0:
+            model.eval()
+            print(f"\n--- Epoch {epoch + 1} Evaluation (50 Random Runs per Dataset) ---")
+
+            stats_p = evaluate_50_runs(model, promis_lists, b_map, args.n_shot, device)
+            print(
+                f"  [PROMIS]     Sen@80Spec: {stats_p['sen@80spec']['mean']:.4f} ± {stats_p['sen@80spec']['std']:.4f}")
+
+            stats_dis = evaluate_50_runs(model, dis_lists, b_map, args.n_shot, device)
+            print(
+                f"  [Cls_dis]    Sen@80Spec: {stats_dis['sen@80spec']['mean']:.4f} ± {stats_dis['sen@80spec']['std']:.4f}")
+
+            stats_piqual = evaluate_50_runs(model, piqual_lists, b_map, args.n_shot, device)
+            print(
+                f"  [Cls_PIQUAL] Sen@80Spec: {stats_piqual['sen@80spec']['mean']:.4f} ± {stats_piqual['sen@80spec']['std']:.4f}")
+
+            current_mean_sen = stats_dis['sen@80spec']['mean']
+            if current_mean_sen > best_acc:
+                best_acc = current_mean_sen
+                torch.save(model.state_dict(), os.path.join(args.output_dir, "best_model.pth"))
+                print("  >> New Best Model Saved (based on Cls_dis)!")
+
+            epoch_log = {
+                "epoch": epoch + 1,
+                "PROMIS_stats": stats_p,
+                "Cls_dis_stats": stats_dis,
+                "Cls_PIQUAL_stats": stats_piqual
+            }
+            log_path = os.path.join(args.output_dir, f"epoch_{epoch + 1}_stats.json")
+            with open(log_path, 'w') as f:
+                json.dump(epoch_log, f, indent=2)
+
+            torch.save(model.state_dict(), os.path.join(args.output_dir, f"epoch_{epoch + 1}.pth"))
+
+    # ==========================================
+    # Phase 2: Final Evaluation 
+    # ==========================================
+    print("\n=== Phase 2: Final Evaluation on Target Domains (50 Runs) ===")
+
+    best_model_path = os.path.join(args.output_dir, "best_model.pth")
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path))
+        print(">>> Loaded best model for final evaluation.")
+
+    print("\n--- Evaluating Cls_dis ---")
+    stats_dis_final = evaluate_50_runs(model, dis_lists, b_map, args.n_shot, device)
+    for k in stats_dis_final.keys():
+        print(f"{k.capitalize():<12}: {stats_dis_final[k]['mean']:.4f} ± {stats_dis_final[k]['std']:.4f}")
+
+    print("\n--- Evaluating Cls_PIQUAL ---")
+    stats_piqual_final = evaluate_50_runs(model, piqual_lists, b_map, args.n_shot, device)
+    for k in stats_piqual_final.keys():
+        print(f"{k.capitalize():<12}: {stats_piqual_final[k]['mean']:.4f} ± {stats_piqual_final[k]['std']:.4f}")
+
+    final_res = {
+        "n_shot": args.n_shot,
+        "epochs": args.epochs,
+        "mode": args.mode,
+        "runs": 50,
+        "Cls_dis_final_stats": stats_dis_final,
+        "Cls_PIQUAL_final_stats": stats_piqual_final
+    }
+
+    with open(os.path.join(args.output_dir, "final_results_50runs.json"), 'w') as f:
+        json.dump(final_res, f, indent=2)
+
+if __name__ == "__main__":
+    main()
+```
